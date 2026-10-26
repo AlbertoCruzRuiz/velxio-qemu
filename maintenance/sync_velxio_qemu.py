@@ -24,9 +24,17 @@ SHA = re.compile(r'^(?:sha256[:=])?([a-fA-F0-9]{64})$')
 VERSIONS = Path('upstream-version.json')
 TRACKED = Path('upstream-files.json')
 HASHES = Path('upstream-hashes.json')
-PROTECTED = {'.git', '.github', '.gitignore', '.gitmodules',
-             'maintenance', 'tests', 'upstream-version.json', 'upstream-files.json', 'upstream-hashes.json'}
+PROTECTED = {
+    '.git', '.github', '.gitignore', '.gitmodules',
+    'maintenance',
+    'upstream-version.json',
+    'upstream-files.json',
+    'upstream-hashes.json'
+}
 
+LOCAL_PROTECTED_FILES = {
+    'tests/test_sync_velxio_qemu.py'
+}
 
 def emit(name, value):
     if os.environ.get('GITHUB_OUTPUT'):
@@ -156,7 +164,12 @@ def parts_for(name):
 
 
 def is_allowed(parts):
-    return bool(parts) and parts[0] not in PROTECTED and not parts[0].startswith('.git')
+    return (
+        bool(parts)
+        and parts[0] not in PROTECTED
+        and not parts[0].startswith('.git')
+        and '/'.join(parts) not in LOCAL_PROTECTED_FILES
+    )
 
 
 def unpack(archive, stage):
@@ -328,7 +341,7 @@ def main():
         if previous and not override and previous not in {a['name'] for a in available}:
             raise ValueError('Previously imported QEMU revision absent from upstream manifest; '
                              'refusing implicit replacement')
-        if previous == chosen['name'] and Path('build_libqemu-esp32.sh').is_file():
+        if (previous == chosen['name'] and Path('build_libqemu-esp32.sh').is_file() and Path('tests/meson.build').is_file() and Path('tests/qtest/libqos/meson.build').is_file()):
             checksum = current.get('verified_sha256') or current.get('sha256')
             if checksum and checksum.lower() != chosen['sha256']:
                 raise ValueError('Published SHA-256 changed for an existing release')
