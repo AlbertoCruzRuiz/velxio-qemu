@@ -23,8 +23,9 @@ ASSET = re.compile(r'^qemu-source-([a-fA-F0-9]{7,40})$')
 SHA = re.compile(r'^(?:sha256[:=])?([a-fA-F0-9]{64})$')
 VERSIONS = Path('upstream-version.json')
 TRACKED = Path('upstream-files.json')
+HASHES = Path('upstream-hashes.json')
 PROTECTED = {'.git', '.github', '.gitignore', '.gitmodules',
-             'maintenance', 'tests', 'upstream-version.json', 'upstream-files.json'}
+             'maintenance', 'tests', 'upstream-version.json', 'upstream-files.json', 'upstream-hashes.json'}
 
 
 def emit(name, value):
@@ -73,7 +74,7 @@ def manifest_assets(obj):
             for item in node:
                 walk(item)
         elif isinstance(node, dict):
-            values = [node.get(k) for k in ('name', 'asset', 'id', 'slug', 'key', 'filename')]
+            values = [node.get(k) for k in ('asset_name', 'name', 'asset', 'id', 'slug', 'key', 'filename')]
             values.append(outer)
             raw = next((v for v in values if isinstance(v, str) and
                         ASSET.fullmatch(v.removesuffix('.tar.gz'))), None)
@@ -88,13 +89,31 @@ def manifest_assets(obj):
                     if found[name]['sha256'] != h:
                         raise ValueError(f'Conflicting checksums for {name}')
                     return
+                # Velxio's current API publishes source dates in the 'version'
+                # field: '2026-10-15+63b37f5e'. It does not return created_at.
+                # Use this authoritative version date rather than JSON array
+                # order: the manifest is *not* sorted by publication date.
+                version = node.get('version')
                 timestamp = None
-                for k in ('published_at', 'created_at', 'uploaded_at', 'updated_at',
-                          'date', 'timestamp', 'published', 'created'):
-                    timestamp = date(node.get(k))
-                    if timestamp:
-                        break
-                entry = {'name': name, 'sha256': h, 'date': timestamp, 'order': len(ordered)}
+                if isinstance(version, str):
+                    source_version = re.fullmatch(
+                        r'(\d{4}-\d{2}-\d{2})\+([a-fA-F0-9]{7,40})', version)
+                    if source_version:
+                        version_commit = source_version.group(2)
+                        if version_commit.lower() != ASSET.fullmatch(name).group(1).lower():
+                            raise ValueError(f'Manifest version/commit mismatch for {name}')
+                        timestamp = date(source_version.group(1))
+                if timestamp is None:
+                    for k in ('published_at', 'created_at', 'uploaded_at', 'updated_at',
+                              'date', 'timestamp', 'published', 'created'):
+                        timestamp = date(node.get(k))
+                        if timestamp:
+                            break
+                size = node.get('size_bytes')
+                if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size <= 0):
+                    raise ValueError(f'Invalid size_bytes for {name}')
+                entry = {'name': name, 'sha256': h, 'date': timestamp,
+                         'size_bytes': size, 'order': len(ordered)}
                 found[name] = entry
                 ordered.append(entry)
                 return
@@ -103,7 +122,8 @@ def manifest_assets(obj):
                     walk(value, key)
     walk(obj)
     if not ordered:
-        raise ValueError('Manifest does not contain qemu-source-<commit> with sha256')
+        top = sorted(obj.keys()) if isinstance(obj, dict) else type(obj).__name__
+        raise ValueError('No qemu-source-<commit> with sha256 in manifest; top-level shape: ' + str(top)[:140])
     return ordered
 
 
@@ -113,11 +133,17 @@ def latest(assets, override):
         if not matches:
             raise ValueError('Requested source asset not present in manifest')
         return matches[0]
-    if all(a['date'] is not None for a in assets):
-        return max(assets, key=lambda a: (a['date'], -a['order']))
-    # Fallback only: visually the official listing is newest first.
-    print('WARNING: missing timestamps; assuming the manifest is newest-first')
-    return assets[0]
+    # A silent 'first entry' fallback can select an older QEMU build because
+    # the current Velxio manifest lists assets in nonchronological order.
+    if any(a['date'] is None for a in assets):
+        raise ValueError('Some QEMU sources have no release date; use SOURCE_ASSET '
+                         'to select a reviewed revision explicitly')
+    newest = max(a['date'] for a in assets)
+    matches = [a for a in assets if a['date'] == newest]
+    if len(matches) != 1:
+        raise ValueError('Several QEMU revisions have the same latest release date; '
+                         'use SOURCE_ASSET explicitly')
+    return matches[0]
 
 
 def parts_for(name):
@@ -145,6 +171,7 @@ def unpack(archive, stage):
             raise ValueError('Cannot locate unique QEMU build script in source tarball')
         prefix = scripts[0][:-1]
         entries = []
+        seen = set()
         total = 0
         symlinks = set()
         for m in members:
@@ -154,6 +181,9 @@ def unpack(archive, stage):
             rel = full[len(prefix):]
             if not is_allowed(rel):
                 continue
+            if rel in seen:
+                raise ValueError('Duplicate paths in QEMU source archive')
+            seen.add(rel)
             if not (m.isfile() or m.isdir() or m.issym()):
                 raise ValueError('Tar archive contains unsupported link/device type')
             if m.size > 95_000_000:
@@ -198,6 +228,19 @@ def unpack(archive, stage):
         return imported
 
 
+def fingerprint(path):
+    """Protect locally modified upstream sources against silent overwrite."""
+    if path.is_symlink():
+        return 'link:' + os.readlink(path)
+    if path.is_file():
+        h = hashlib.sha256()
+        with path.open('rb') as f:
+            while chunk := f.read(1024 * 1024):
+                h.update(chunk)
+        return 'sha256:' + h.hexdigest()
+    return None
+
+
 def import_tree(stage, paths):
     old = set()
     if TRACKED.exists():
@@ -205,8 +248,37 @@ def import_tree(stage, paths):
         if not isinstance(prior, list) or any(not isinstance(p, str) for p in prior):
             raise ValueError('Invalid upstream-files.json')
         old = set(prior)
-    else:
-        print('First sync: will not delete older source files without a baseline manifest')
+    elif not VERSIONS.exists():
+        print('BOOTSTRAP: no QEMU sources imported yet; preparing first PR', flush=True)
+
+    if old and not HASHES.exists():
+        raise ValueError('Existing import has no upstream-hashes.json baseline. Review/migrate it before updating.')
+    hashes = json.loads(HASHES.read_text(encoding='utf-8')) if HASHES.exists() else {}
+    if not isinstance(hashes, dict):
+        raise ValueError('Invalid upstream-hashes.json')
+
+    # Stop, rather than destroying changes made manually inside the QEMU source.
+    for path in sorted(old):
+        parts = parts_for(path)
+        if not is_allowed(parts):
+            continue
+        expected = hashes.get(path)
+        if expected is None or fingerprint(Path(path)) != expected:
+            raise ValueError('Local QEMU source differs from last imported revision: ' + path
+                             + '. Rebase your patch manually; nothing has been overwritten.')
+
+    # Check all paths before any update. Reject collisions with maintenance files.
+    for path in sorted(paths):
+        parts = parts_for(path)
+        dest = Path(*parts)
+        if not is_allowed(parts):
+            raise ValueError('Import would overwrite protected path')
+        if any(parent.is_symlink() for parent in list(dest.parents)[:-1]):
+            raise ValueError(f'Unexpected symlink in destination parent for {path}')
+        if dest.exists() and dest.is_dir() and not dest.is_symlink():
+            raise ValueError('File/directory conflict for ' + path)
+        if path not in old and (dest.exists() or dest.is_symlink()):
+            raise ValueError('Source import collides with an existing non-upstream file: ' + path)
 
     for path in sorted(old - paths):
         parts = parts_for(path)
@@ -214,10 +286,9 @@ def import_tree(stage, paths):
             dest = Path(*parts)
             if dest.is_file() or dest.is_symlink():
                 dest.unlink()
+    new_hashes = {}
     for path in sorted(paths):
         source, dest = stage / path, Path(path)
-        if any(parent.is_symlink() for parent in list(dest.parents)[:-1]):
-            raise ValueError(f'Unexpected symlink in destination parent for {path}')
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.is_symlink() or dest.is_file():
             dest.unlink()
@@ -227,8 +298,10 @@ def import_tree(stage, paths):
             dest.symlink_to(os.readlink(source))
         else:
             shutil.copy2(source, dest, follow_symlinks=False)
+        new_hashes[path] = fingerprint(source)
 
     TRACKED.write_text(json.dumps(sorted(paths), indent=2) + '\n', encoding='utf-8')
+    HASHES.write_text(json.dumps(new_hashes, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 
 
 def main():
@@ -239,20 +312,27 @@ def main():
     if override and not ASSET.fullmatch(override):
         raise ValueError('SOURCE_ASSET must have the form qemu-source-<commit>')
     current = json.loads(VERSIONS.read_text(encoding='utf8')) if VERSIONS.exists() else {}
+    if not VERSIONS.exists():
+        print('INITIAL IMPORT: upstream-version.json does not exist', flush=True)
     previous = current.get('source_asset') or (
         'qemu-source-' + current['qemu_commit'] if current.get('qemu_commit') else '')
 
     with tempfile.TemporaryDirectory(prefix='velxio-qemu-update-') as d:
         tmp = Path(d)
         manifest = tmp / 'manifest.json'
+        print('Fetching Velxio source manifest (credential redacted)', flush=True)
         api_get(None, key, manifest)
         available = manifest_assets(json.loads(manifest.read_text(encoding='utf8')))
         chosen = latest(available, override)
+        print(f'Source candidates: {len(available)}; selected: {chosen["name"]}', flush=True)
+        if previous and not override and previous not in {a['name'] for a in available}:
+            raise ValueError('Previously imported QEMU revision absent from upstream manifest; '
+                             'refusing implicit replacement')
         if previous == chosen['name'] and Path('build_libqemu-esp32.sh').is_file():
             checksum = current.get('verified_sha256') or current.get('sha256')
             if checksum and checksum.lower() != chosen['sha256']:
                 raise ValueError('Published SHA-256 changed for an existing release')
-            print('Already on newest source:', chosen['name'])
+            print('Already on newest source:', chosen['name'], flush=True)
             emit('changed', 'false')
             return
         previous_asset = next((a for a in available if a['name'] == previous), None)
@@ -264,8 +344,10 @@ def main():
                 raise ValueError('Aborting downgrade by manifest order')
 
         tarball = tmp / 'source.tar.gz'
-        print('Downloading', chosen['name'], 'SHA256:', chosen['sha256'])
+        print('Downloading', chosen['name'], 'expected SHA256:', chosen['sha256'], flush=True)
         api_get(chosen['name'], key, tarball)
+        if chosen['size_bytes'] is not None and tarball.stat().st_size != chosen['size_bytes']:
+            raise ValueError('Source tarball size_bytes mismatch')
         with tarball.open('rb') as f:
             digest = hashlib.file_digest(f, 'sha256').hexdigest()
         if digest != chosen['sha256']:
@@ -286,7 +368,7 @@ def main():
         emit('changed', 'true')
         emit('asset', chosen['name'])
         emit('sha256', chosen['sha256'])
-        print('Imported', len(paths), 'source files; PR can now be prepared')
+        print('Imported', len(paths), 'source files; PR can now be prepared', flush=True)
 
 
 if __name__ == '__main__':
@@ -294,5 +376,5 @@ if __name__ == '__main__':
         main()
     except (ValueError, OSError, RuntimeError, tarfile.TarError, json.JSONDecodeError) as err:
         # Avoid URLs in exceptions, since the query contains a license key.
-        print('ERROR:', str(err)[:250], file=sys.stderr)
+        print('::error::QEMU source synchronisation failed: ' + str(err)[:250], file=sys.stderr, flush=True)
         sys.exit(1)
