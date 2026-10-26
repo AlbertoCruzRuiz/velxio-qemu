@@ -17,7 +17,15 @@ def archive(path, evil_link=False):
         'upstream-1234/build_libqemu-esp32.sh': b'build',
         'upstream-1234/configure': b'config',
         'upstream-1234/meson.build': b'project()',
+
         'upstream-1234/hw/i2c/peripheral.c': b'int i = 1;',
+
+        # QEMU Meson source tree
+        'upstream-1234/tests/meson.build': b'# tests\n',
+        'upstream-1234/tests/qtest/meson.build': b'# qtest\n',
+        'upstream-1234/tests/qtest/libqos/meson.build': b'# libqos\n',
+
+        # Must remain protected
         'upstream-1234/.github/workflows/evil.yml': b'permissions: write-all',
     }
     with tarfile.open(path, 'w:gz') as tf:
@@ -157,18 +165,17 @@ class BootstrapTests(unittest.TestCase):
                 os.chdir(root)
                 with patch.object(sync, 'api_get', side_effect=fake_api_get), \
                      patch.object(sync, 'emit', side_effect=lambda k,v: results.append((k,v))), \
-                     patch.dict(os.environ, {'VELXIO_LICENSE_KEY': 'redacted-test-key',
-                                              'SOURCE_ASSET': ''}):
+                     patch.dict(os.environ, {'VELXIO_LICENSE_KEY': 'redacted-test-key', 'SOURCE_ASSET': ''}):
                     sync.main()
                     self.assertTrue((root / 'build_libqemu-esp32.sh').is_file())
+                    self.assertTrue((root / 'tests/qtest/libqos/meson.build').is_file())
                     self.assertEqual(json.loads((root / 'upstream-version.json').read_text())['qemu_commit'], '63b37f5e')
                     self.assertIn(('changed', 'true'), results)
                     results.clear()
                     sync.main()
                     self.assertIn(('changed', 'false'), results)
                     (root / 'hw/i2c/peripheral.c').write_text('custom patch')
-                    manifest['assets'].insert(0, {'asset_name': 'qemu-source-ffffffff', 'sha256': digest,
-                                                 'version': '2026-10-16+ffffffff'})
+                    manifest['assets'].insert(0, {'asset_name': 'qemu-source-ffffffff', 'sha256': digest, 'version': '2026-10-16+ffffffff'})
                     with self.assertRaisesRegex(ValueError, 'Local QEMU source differs'):
                         sync.main()
             finally:
