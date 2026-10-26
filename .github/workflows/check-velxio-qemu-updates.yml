@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       source_asset:
-        description: 'Optional: qemu-source-63b37f5e (blank = newest)'
+        description: 'Optional: qemu-source-63b37f5e (empty = newest in manifest)'
         required: false
         type: string
 
@@ -21,25 +21,50 @@ concurrency:
 jobs:
   propose-update:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: main
           persist-credentials: false
 
-      - name: Test source importer offline
+      - name: Validate updater (offline tests, no secrets)
         run: python3 -m unittest discover -s tests -v
 
-      - name: Download and verify QEMU source without executing it
+      - name: Identify initial import
+        shell: bash
+        run: |
+          if [[ ! -f upstream-version.json || ! -f build_libqemu-esp32.sh ]]; then
+            echo 'INITIAL IMPORT: QEMU source not yet populated on main.'
+            echo 'The updater must prepare a PR with the entire verified source tree.'
+          else
+            echo 'UPDATE CHECK: existing QEMU sources found.'
+          fi
+
+      - name: Download, verify and stage QEMU source (no code execution)
         id: sync
+        shell: bash
         env:
           VELXIO_LICENSE_KEY: ${{ secrets.VELXIO_LICENSE_KEY }}
           SOURCE_ASSET: ${{ inputs.source_asset || '' }}
-        run: python3 maintenance/sync_velxio_qemu.py
+        run: |
+          set -euo pipefail
+          python3 -u maintenance/sync_velxio_qemu.py
 
-      - name: Create or update review PR
+      - name: Inspect staged import
+        if: steps.sync.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'First changed paths (source only, no secret values):'
+          git status --short | head -40 || true
+          echo "Tracked QEMU input files: $(python3 -c 'import json; print(len(json.load(open("upstream-files.json"))))')"
+          test -s build_libqemu-esp32.sh
+          test -s configure
+          test -s meson.build
+
+      - name: Create or update review PR (never auto-merge)
         id: pr
         if: steps.sync.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v8
@@ -48,28 +73,38 @@ jobs:
           base: main
           branch: bot/velxio-qemu-upstream
           delete-branch: true
-          title: 'chore(qemu): update to ${{ steps.sync.outputs.asset }}'
+          title: 'chore(qemu): import ${{ steps.sync.outputs.asset }}'
           commit-message: 'chore(qemu): import ${{ steps.sync.outputs.asset }}'
           body: |
-            ## Actualización de fuentes QEMU
+            ## QEMU: fuente GPL-2.0 verificada
+
             - Revisión: `${{ steps.sync.outputs.asset }}`
-            - SHA-256 verificado: `${{ steps.sync.outputs.sha256 }}`
+            - SHA-256 de origen: `${{ steps.sync.outputs.sha256 }}`
+            - Importada SIN ejecutar archivos del tarball
 
-            El archivo fue verificado e importado **sin ejecutar su código**.
-            Nuestros workflows y scripts de mantenimiento no se sobrescribieron.
+            **Revisión humana requerida. No fusionar automáticamente.**
+            Comprobar compilación libqemu-xtensa/libqemu-riscv32 y las pruebas
+            ESP32-S3, flash/PSRAM OPI, GPIO, Grove, WiFi y MQTT, sin secretos.
+            Los cambios en código QEMU personalizado deben revisarse por separado.
 
-            **Revisar antes de mergear**. Compilar QEMU y comprobar ESP32-S3,
-            flash/PSRAM OPI, GPIO, Grove, WiFi y MQTT en CI sin secretos.
-            Tras el merge hay que actualizar el submódulo del fork de Velxio.
-
-      - name: Job summary
+      - name: Job summary (even if a step fails)
         if: always()
+        shell: bash
         env:
+          SYNC_OUTCOME: ${{ steps.sync.outcome }}
           CHANGED: ${{ steps.sync.outputs.changed }}
           ASSET: ${{ steps.sync.outputs.asset }}
           PR_URL: ${{ steps.pr.outputs.pull-request-url }}
         run: |
-          echo '## Velxio QEMU monitor' >> "$GITHUB_STEP_SUMMARY"
-          echo "Changed: ${CHANGED:-false}" >> "$GITHUB_STEP_SUMMARY"
-          if [ -n "$ASSET" ]; then echo "Asset: $ASSET" >> "$GITHUB_STEP_SUMMARY"; fi
-          if [ -n "$PR_URL" ]; then echo "PR: $PR_URL" >> "$GITHUB_STEP_SUMMARY"; fi
+          {
+            echo '## Velxio QEMU monitor'
+            echo "Sync step: ${SYNC_OUTCOME:-not-run}"
+            if [ "$SYNC_OUTCOME" = 'success' ]; then
+              echo "Source changed: ${CHANGED:-false}"
+            else
+              echo '**Import failed or did not run. No conclusion about available updates.**'
+              echo 'Expand the red step to view the exact failure, not just exit code.'
+            fi
+            if [ -n "$ASSET" ]; then echo "Source: \`$ASSET\`"; fi
+            if [ -n "$PR_URL" ]; then echo "PR: $PR_URL"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
