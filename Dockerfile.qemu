@@ -1,0 +1,79 @@
+# syntax=docker/dockerfile:1.7
+
+# Velxio QEMU - Standalone binary build
+# Output: /qemu/*.so and /qemu/*.bin
+
+FROM ubuntu:22.04 AS qemu-build
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      git wget curl ca-certificates \
+      python3 python3-pip python3-setuptools \
+      ninja-build pkg-config flex bison dpkg-dev \
+      libglib2.0-dev libgcrypt20-dev libslirp-dev \
+      libpixman-1-dev libfdt-dev zlib1g-dev \
+      jq file binutils && \
+    python3 -m pip install --no-cache-dir \
+      'meson==1.2.3' tomli && \
+    rm -rf /var/lib/apt/lists/*
+
+# Compatibility with the QEMU link script
+RUN multiarch="$(dpkg-architecture -q DEB_HOST_MULTIARCH)" && \
+    mkdir -p "/usr/lib/${multiarch}" && \
+    ar rcs "/usr/lib/${multiarch}/libiconv.a"
+
+WORKDIR /src
+
+# Copy this repository's QEMU source
+COPY . /src/
+
+# Build Xtensa and RISC-V libraries
+RUN test -s build_libqemu-esp32.sh && \
+    bash build_libqemu-esp32.sh
+
+# Package compiled libraries and ROM files
+RUN set -eux; \
+    mkdir -p /qemu; \
+    for arch in xtensa riscv32; do \
+      so="/src/build/libqemu-${arch}.so"; \
+      test -s "${so}"; \
+      test "$(stat -c %s "${so}")" -gt 1000000; \
+      cp "${so}" /qemu/; \
+    done; \
+    for rom in \
+      esp32-v3-rom.bin \
+      esp32-v3-rom-app.bin \
+      esp32c3-rom.bin \
+      esp32s3_rev0_rom.bin; do \
+      test -s "/src/pc-bios/${rom}"; \
+      cp "/src/pc-bios/${rom}" /qemu/; \
+    done
+
+# Validate binaries and exported symbols
+RUN set -eux; \
+    for so in /qemu/*.so; do \
+      file "${so}" | grep -F 'ELF 64-bit'; \
+      ldd "${so}" > /tmp/ldd-output; \
+      cat /tmp/ldd-output; \
+      if grep -q 'not found' /tmp/ldd-output; then \
+        exit 1; \
+      fi; \
+    done; \
+    nm -D /qemu/libqemu-xtensa.so \
+      | grep -F 'qemu_picsimlab_register_callbacks'
+
+# Generate integrity checksums
+RUN cd /qemu && \
+    sha256sum *.so *.bin > SHA256SUMS
+
+# Final image contains only QEMU artifacts
+FROM scratch
+
+LABEL org.opencontainers.image.source="https://github.com/AlbertoCruzRuiz/velxio-qemu"
+LABEL org.opencontainers.image.description="Velxio QEMU shared libraries and ESP32 ROMs"
+
+COPY --from=qemu-build /qemu/ /qemu/
