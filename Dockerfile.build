@@ -1,0 +1,57 @@
+# Dockerfile to build libqemu-xtensa.so with the Velxio ESP32-CAM
+# patches (OV2640 SCCB device + I²S camera/DVP peripheral).
+#
+# Build:
+#   docker build -f wokwi-libs/qemu-lcgamboa/Dockerfile.build \
+#                -t velxio-qemu-build wokwi-libs/qemu-lcgamboa
+#
+# Extract the result:
+#   id=$(docker create velxio-qemu-build) && \
+#   docker cp $id:/out/libqemu-xtensa.so backend/app/services/libqemu-xtensa.so && \
+#   docker cp $id:/out/libqemu-riscv32.so backend/app/services/libqemu-riscv32.so && \
+#   docker rm $id
+#
+# Then restart the backend; the new .so picks up automatically (the
+# Python loader uses ctypes.CDLL on the file in its own dir).
+
+FROM ubuntu:22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    git \
+    perl \
+    python3 \
+    python3-venv \
+    python3-pip \
+    python3-setuptools \
+    python3-wheel \
+    ninja-build \
+    libglib2.0-dev \
+    libpixman-1-dev \
+    libgcrypt20-dev \
+    libslirp-dev \
+    zlib1g-dev \
+    libssl-dev \
+    flex \
+    bison \
+    meson \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . /src/
+
+RUN bash build_libqemu-esp32.sh
+
+# Copy artifacts to a flat /out directory for easy extraction.
+RUN mkdir -p /out && \
+    cp build/libqemu-xtensa.so /out/ && \
+    cp build/libqemu-riscv32.so /out/ && \
+    ls -lh /out/
+
+# Final stage exposes only the .so files.
+FROM scratch
+COPY --from=builder /out/libqemu-xtensa.so /libqemu-xtensa.so
+COPY --from=builder /out/libqemu-riscv32.so /libqemu-riscv32.so
