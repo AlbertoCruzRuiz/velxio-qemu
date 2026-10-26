@@ -1,4 +1,4 @@
-name: Build and Publish Velxio QEMU
+name: Build and Publish Velxio IoT QEMU
 
 on:
   push:
@@ -26,6 +26,10 @@ jobs:
     name: Build QEMU (linux/amd64)
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+
+    # Export the exact image tag actually published by this job.
+    outputs:
+      sha_image: ${{ steps.meta.outputs.sha_image }}
 
     steps:
       - name: Checkout QEMU source
@@ -57,11 +61,13 @@ jobs:
           set -euo pipefail
 
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sha_image="${image}:sha-${GITHUB_SHA}"
 
           {
             echo "image=${image}"
+            echo "sha_image=${sha_image}"
             echo "tags<<EOF"
-            echo "${image}:sha-${GITHUB_SHA}"
+            echo "${sha_image}"
 
             if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
               echo "${image}:latest"
@@ -111,4 +117,65 @@ jobs:
             echo "- Platform: \`linux/amd64\`"
             echo "- Event: \`${EVENT}\`"
             echo "- Digest: \`${DIGEST:-not published}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify-velxio:
+    name: Notify Velxio IoT
+    needs: build-qemu
+    # On PRs we only validate; version-tag builds do not advance :latest.
+    # A manual run on main also publishes :latest and should notify Velxio.
+    if: >-
+      ${{ github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Dispatch QEMU update to velxio_iot
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.VELXIO_IOT_DISPATCH_TOKEN }}
+          QEMU_IMAGE: ${{ needs.build-qemu.outputs.sha_image }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TOKEN}" ]]; then
+            echo "::error::Configure VELXIO_IOT_DISPATCH_TOKEN as an Actions secret in velxio-qemu."
+            exit 1
+          fi
+          if [[ -z "${QEMU_IMAGE}" ]]; then
+            echo "::error::The QEMU build did not provide a published image tag."
+            exit 1
+          fi
+
+          # QEMU_IMAGE comes from this build's image metadata, not user input.
+          printf '{"event_type":"qemu-published","client_payload":{"qemu_image":"%s"}}' \
+            "${QEMU_IMAGE}" > "${RUNNER_TEMP}/qemu-dispatch.json"
+
+          status="$(curl --silent --show-error --fail-with-body \
+            --output "${RUNNER_TEMP}/qemu-dispatch-response.txt" \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer ${TOKEN}" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --header 'Content-Type: application/json' \
+            --data-binary "@${RUNNER_TEMP}/qemu-dispatch.json" \
+            'https://api.github.com/repos/AlbertoCruzRuiz/velxio_iot/dispatches')"
+
+          if [[ "${status}" != '204' ]]; then
+            echo "::error::Unexpected repository_dispatch response: HTTP ${status}"
+            exit 1
+          fi
+
+          {
+            echo '### Velxio IoT notified'
+            echo ''
+            echo "- QEMU image: \`${QEMU_IMAGE}\`"
+            echo '- Event: `qemu-published`'
+            echo '- Target repository: `AlbertoCruzRuiz/velxio_iot`'
+            echo '- Dispatch accepted (HTTP 204)'
           } >> "$GITHUB_STEP_SUMMARY"
