@@ -4,15 +4,17 @@ This archive is the complete corresponding source, under GPL-2.0, for the
 prebuilt QEMU libraries Velxio distributes. It is offered to everyone who
 receives one of those binaries, with no further conditions attached.
 
-- Commit: `63b37f5e26bf198617de6fa43cdbd139fe0cdbc1`
-- Commit date: 2026-10-15
-- Subject: ci(win): build the Windows DLLs under MSYS2 UCRT64
+- Commit: `985803692859cf8f08a48e4f13bbf95e8a6e6798`
+- Commit date: 2026-10-31
+- Subject: fix(esp32s3_gpio): the S3 GPIO block uses the S3's register map, and its interrupt reaches the CPU
 - Repository: a Velxio fork of https://github.com/lcgamboa/qemu
   (branch `picsimlab-esp32`), which is itself a fork of QEMU.
 
 ## Which binaries this corresponds to
 
-- `libqemu-xtensa-macos-arm64` (version 1.2.9)
+- `libqemu-xtensa-amd64` (version 1.2.10)
+- `libqemu-xtensa-arm64` (version 1.2.10)
+- `libqemu-xtensa-macos-arm64` (version 1.2.10)
 
 Those assets are served from
 `https://velxio.dev/api/pro/license/downloads/<asset>?key=<your key>`.
@@ -60,6 +62,7 @@ Files this tree changes or adds relative to `lcgamboa/qemu picsimlab-esp32`:
   hw/gpio/Kconfig
   hw/gpio/esp32_gpio.c
   hw/gpio/esp32c3_gpio.c
+  hw/gpio/esp32s3_gpio.c
   hw/gpio/meson.build
   hw/gpio/stm32_gpio.c
   hw/i2c/Kconfig
