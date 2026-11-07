@@ -1,7 +1,7 @@
 {
   "source": "velxio.dev (GPL-2.0)",
-  "source_asset": "qemu-source-63b37f5e",
-  "qemu_commit": "63b37f5e",
-  "verified_sha256": "f36f04e8e156211783db0bfd408db66450e170df536f8f893f58ef09743cfe39",
-  "published_at": "2026-10-15T00:00:00+00:00"
+  "source_asset": "qemu-source-98580369",
+  "qemu_commit": "98580369",
+  "verified_sha256": "2ed11c89094bed93059c48981fd23e6a158274fc514e261a980004387d4140e8",
+  "published_at": "2026-10-31T00:00:00+00:00"
 }
