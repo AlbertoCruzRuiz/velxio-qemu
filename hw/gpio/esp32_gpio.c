@@ -31,6 +31,29 @@ extern void (*picsimlab_gpio_matrix_cb)(int gpio, int signal_id);
 #include "hw/gpio/esp32_gpio.h"
 #include "sysemu/runstate.h"
 
+/* ESP32 (soc/esp32/gpio_reg.h). INT_ENA bit 2 (PIN bit 15) routes a pin's
+ * interrupt to the PRO CPU, bit 0 (PIN bit 13) to the APP CPU
+ * (hal/esp32/gpio_ll.h GPIO_LL_*_CPU_INTR_ENA). */
+static const Esp32GpioLayout esp32_gpio_layout = {
+    .pin_base = 0x88,
+    .pin_end = 0x130,
+    .in_sel_base = 0x130,
+    .out_sel_base = 0x530,
+    .out_sel_end = 0x5d0,
+    .pro_int = 0x68,
+    .pro_int1 = 0x7c,
+    .app_int = 0x60,
+    .app_int1 = 0x74,
+    .pro_ena = 1 << 15,
+    .app_ena = 1 << 13,
+};
+
+static const Esp32GpioLayout *esp32_gpio_layout_of(Esp32GpioState *s)
+{
+    const Esp32GpioLayout *l = ESP32_GPIO_GET_CLASS(s)->layout;
+    return l ? l : &esp32_gpio_layout;
+}
+
 
 static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
 {
@@ -66,31 +89,28 @@ static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
         case 0x50: //GPIO_STATUS1_REG
             r = s->gpio_status1;
             break;
-        case 0x60: //GPIO_ACPU_INT_REG
-            r = s->gpio_acpu_int;
-            break;
-        case 0x68: //GPIO_PCPU_INT_REG
-            r = s->gpio_pcpu_int;
-            break;
-        case 0x74: //GPIO_ACPU_INT1_REG
-            r = s->gpio_acpu_int1;
-            break;
-        case 0x7c: //GPIO_PCPU_INT1_REG
-            r = s->gpio_pcpu_int1;
-            break;
         default:
             break;
     }
-    if (addr >= 0x88 && addr < 0x130) { //GPIO_PINXX_REG
-        int n = (addr - 0x88) / 4;
+    const Esp32GpioLayout *l = esp32_gpio_layout_of(s);
+    if (l->pro_int && addr == l->pro_int) {
+        r = s->gpio_pcpu_int;
+    } else if (l->pro_int1 && addr == l->pro_int1) {
+        r = s->gpio_pcpu_int1;
+    } else if (l->app_int && addr == l->app_int) {
+        r = s->gpio_acpu_int;
+    } else if (l->app_int1 && addr == l->app_int1) {
+        r = s->gpio_acpu_int1;
+    } else if (addr >= l->pin_base && addr < l->pin_end) { //GPIO_PINXX_REG
+        int n = (addr - l->pin_base) / 4;
         r = s->gpio_pin[n];
     }
-    else if (addr >= 0x130 && addr < 0x530) { //GPIO_FUNCY_IN_SEL_CFG_REG 
-        int n = (addr - 0x130) / 4;
+    else if (addr >= l->in_sel_base && addr < l->out_sel_base) { //GPIO_FUNCY_IN_SEL_CFG_REG
+        int n = (addr - l->in_sel_base) / 4;
         r = s->gpio_in_sel[n];
     }
-    else if (addr >= 0x530 && addr < 0x5d0) { //GPIO_FUNCX_OUT_SEL_CFG_REG 
-        int n = (addr - 0x530) / 4;
+    else if (addr >= l->out_sel_base && addr < l->out_sel_end) { //GPIO_FUNCX_OUT_SEL_CFG_REG
+        int n = (addr - l->out_sel_base) / 4;
         r = s->gpio_out_sel[n];
     }
     return r;
@@ -115,18 +135,18 @@ static int get_triggering(int int_type, int oldval, int val) {
 
 static void set_gpio(void *opaque, int n, int val) {
     Esp32GpioState *s = ESP32_GPIO(opaque);
+    const Esp32GpioLayout *l = esp32_gpio_layout_of(s);
     if (n < 32) {
         int oldval = (s->gpio_in >> n) & 1;
         int int_type = (s->gpio_pin[n] >> 7) & 7;
         s->gpio_in &= ~(1 << n);
         s->gpio_in |= (val << n);
         int irq = get_triggering(int_type, oldval, val);
-        // says bit 16 in the ref manual, is that wrong?
-        if (irq && (s->gpio_pin[n] & (1 << 15))) {  // pro cpu int enable
+        if (irq && (s->gpio_pin[n] & l->pro_ena)) {  // pro cpu int enable
             qemu_set_irq(s->irq, 1);
             s->gpio_pcpu_int |= (1 << n);
         }
-        if (irq && (s->gpio_pin[n] & (1 << 13))) {  // app cpu int enable
+        if (irq && (s->gpio_pin[n] & l->app_ena)) {  // app cpu int enable
             qemu_set_irq(s->irq, 1);
             s->gpio_acpu_int |= (1 << n);
         }
@@ -137,12 +157,11 @@ static void set_gpio(void *opaque, int n, int val) {
         s->gpio_in1 &= ~(1 << n1);
         s->gpio_in1 |= (val << n1);
         int irq = get_triggering(int_type, oldval, val);
-        // says bit 16 in the ref manual, is that wrong?
-        if (irq && (s->gpio_pin[n] & (1 << 15))) {  // pro cpu int enable
+        if (irq && (s->gpio_pin[n] & l->pro_ena)) {  // pro cpu int enable
             qemu_set_irq(s->irq, 1);
             s->gpio_pcpu_int1 |= (1 << n1);
         }
-        if (irq && (s->gpio_pin[n] & (1 << 13))) {  // app cpu int enable
+        if (irq && (s->gpio_pin[n] & l->app_ena)) {  // app cpu int enable
             qemu_set_irq(s->irq, 1);
             s->gpio_acpu_int1 |= (1 << n1);
         }
@@ -233,7 +252,7 @@ static void esp32_gpio_write(void *opaque, hwaddr addr, uint64_t value,
             break;
         case 0x58: //GPIO_STATUS1_W1TC_REG 
             clearirq = 1;
-            for (int i = 0; i < 32; i++) {
+            for (int i = 0; i < 32 && i + 32 < ARRAY_SIZE(s->gpio_pin); i++) {
                 if ((1 << i) & value) {
                     int int_type = (s->gpio_pin[i + 32] >> 7) & 7;
                     if ((int_type == 4 && !(s->gpio_in1 & (1 << i))) ||
@@ -249,17 +268,18 @@ static void esp32_gpio_write(void *opaque, hwaddr addr, uint64_t value,
             }
             break;
     }
-    if (addr >= 0x88 && addr < 0x130) { //GPIO_PINXX_REG
-        int n = (addr - 0x88) / 4;
+    const Esp32GpioLayout *l = esp32_gpio_layout_of(s);
+    if (addr >= l->pin_base && addr < l->pin_end) { //GPIO_PINXX_REG
+        int n = (addr - l->pin_base) / 4;
         s->gpio_pin[n] = value;
     }
-    else if (addr >= 0x130 && addr < 0x530) { //GPIO_FUNCY_IN_SEL_CFG_REG
-        int n = (addr - 0x130) / 4;
+    else if (addr >= l->in_sel_base && addr < l->out_sel_base) { //GPIO_FUNCY_IN_SEL_CFG_REG
+        int n = (addr - l->in_sel_base) / 4;
         s->gpio_in_sel[n] = value;
         qemu_set_irq(s->gpios_sync[0], (0x1000 | n)); //report in sel cfg change
     }
-    else if (addr >= 0x530 && addr < 0x5d0) { //GPIO_FUNCX_OUT_SEL_CFG_REG 
-        int n = (addr - 0x530) / 4;
+    else if (addr >= l->out_sel_base && addr < l->out_sel_end) { //GPIO_FUNCX_OUT_SEL_CFG_REG
+        int n = (addr - l->out_sel_base) / 4;
         s->gpio_out_sel[n] = value;
         /* Legacy gpios_sync IRQ encodes signal_id in 8 bits; signal
          * 0x100 (clear) is indistinguishable from signal 0. Emit it
@@ -371,6 +391,7 @@ static void esp32_gpio_class_init(ObjectClass *klass, void *data)
     rc->phases.hold = esp32_gpio_reset_hold;
     dc->realize = esp32_gpio_realize;
     device_class_set_props(dc, esp32_gpio_properties);
+    ESP32_GPIO_CLASS(klass)->layout = &esp32_gpio_layout;
 }
 
 static const TypeInfo esp32_gpio_info = {
