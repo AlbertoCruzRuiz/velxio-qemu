@@ -778,6 +778,10 @@ static void esp32s3_machine_init(MachineState *machine)
         sysbus_realize(SYS_BUS_DEVICE(&ss->gpio), &error_fatal);
         MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->gpio), 0);
         memory_region_add_subregion_overlap(sys_mem, DR_REG_GPIO_BASE, mr, 0);
+        /* The GPIO block's interrupt, which nothing listened to until
+         * 2026-10-31: attachInterrupt() armed a pin whose ISR never ran. */
+        sysbus_connect_irq(SYS_BUS_DEVICE(&ss->gpio), 0,
+                           qdev_get_gpio_in(intmatrix_dev, ETS_GPIO_INTR_SOURCE));
     }
 
     {
